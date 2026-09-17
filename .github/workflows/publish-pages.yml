@@ -1,0 +1,94 @@
+name: Publish static data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Prepare output
+        shell: bash
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SOURCE_URL:-}" ]; then
+            echo "SOURCE_URL secret is not configured."
+            exit 1
+          fi
+
+          mkdir -p site/data/v1
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-delay 2 \
+            --max-time 30 \
+            "$SOURCE_URL" \
+            --output site/data/v1/cache.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("site/data/v1/cache.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+
+          if not isinstance(data, dict):
+              raise SystemExit("Payload root must be a JSON object.")
+
+          if data.get("status") != "ok":
+              raise SystemExit("Payload status is not ok.")
+
+          worlds = data.get("worlds")
+          if not isinstance(worlds, list):
+              raise SystemExit("Payload worlds must be an array.")
+
+          world_count = data.get("worldCount")
+          if not isinstance(world_count, int):
+              raise SystemExit("Payload worldCount must be an integer.")
+
+          if world_count != len(worlds):
+              raise SystemExit("worldCount does not match worlds length.")
+
+          if world_count <= 0:
+              raise SystemExit("Refusing to publish an empty payload.")
+
+          print(f"Validated {world_count} worlds.")
+          PY
+
+          printf 'User-agent: *\nDisallow: /\n' > site/robots.txt
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

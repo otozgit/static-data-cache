@@ -3,7 +3,7 @@ name: Publish static data
 on:
   workflow_dispatch:
   schedule:
-    - cron: "3,13,23,33,43,53 * * * *"
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: read

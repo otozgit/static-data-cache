@@ -26,7 +26,6 @@ jobs:
         shell: bash
         env:
           SOURCE_URL: ${{ secrets.SOURCE_URL }}
-          WORLD_INDEX_URL: ${{ secrets.WORLD_INDEX_URL }}
 
         run: |
           set -euo pipefail
@@ -36,10 +35,17 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${WORLD_INDEX_URL:-}" ]; then
-            echo "WORLD_INDEX_URL secret is not configured."
-            exit 1
-          fi
+          # SOURCE_URL:
+          # https://xxxxx/portal-data.json
+          #
+          # から自動的に:
+          # https://xxxxx/world-index.csv
+          #
+          # を生成する
+          WORLD_INDEX_URL="${SOURCE_URL%/portal-data.json}/world-index.csv"
+
+          echo "Preparing portal data."
+          echo "World index URL derived from SOURCE_URL."
 
           mkdir -p site/data/v1
 
@@ -76,9 +82,9 @@ jobs:
           json_path = Path("site/data/v1/cache.json")
           csv_path = Path("site/data/v1/world-index.csv")
 
-          # ---------------------------------------------
-          # Validate portal JSON
-          # ---------------------------------------------
+          # ------------------------------
+          # cache.json validation
+          # ------------------------------
 
           data = json.loads(
               json_path.read_text(encoding="utf-8")
@@ -118,9 +124,9 @@ jobs:
                   "Refusing to publish an empty payload."
               )
 
-          # ---------------------------------------------
-          # Validate world-index.csv
-          # ---------------------------------------------
+          # ------------------------------
+          # world-index.csv validation
+          # ------------------------------
 
           world_id_regex = re.compile(
               r"^wrld_[0-9a-fA-F]{8}-"
@@ -164,8 +170,8 @@ jobs:
           ):
               if len(row) != 2:
                   raise SystemExit(
-                      f"Invalid CSV column count at row "
-                      f"{row_number}."
+                      f"Invalid CSV column count "
+                      f"at row {row_number}."
                   )
 
               world_id, world_name = row

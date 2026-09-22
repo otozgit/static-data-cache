@@ -26,6 +26,8 @@ jobs:
         shell: bash
         env:
           SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          WORLD_INDEX_URL: ${{ secrets.WORLD_INDEX_URL }}
+
         run: |
           set -euo pipefail
 
@@ -34,8 +36,14 @@ jobs:
             exit 1
           fi
 
+          if [ -z "${WORLD_INDEX_URL:-}" ]; then
+            echo "WORLD_INDEX_URL secret is not configured."
+            exit 1
+          fi
+
           mkdir -p site/data/v1
 
+          # Main portal JSON
           curl \
             --fail \
             --silent \
@@ -47,37 +55,161 @@ jobs:
             "$SOURCE_URL" \
             --output site/data/v1/cache.json
 
+          # World ID -> World Name CSV
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-delay 2 \
+            --max-time 30 \
+            "$WORLD_INDEX_URL" \
+            --output site/data/v1/world-index.csv
+
           python3 - <<'PY'
+          import csv
           import json
+          import re
           from pathlib import Path
 
-          path = Path("site/data/v1/cache.json")
-          data = json.loads(path.read_text(encoding="utf-8"))
+          json_path = Path("site/data/v1/cache.json")
+          csv_path = Path("site/data/v1/world-index.csv")
+
+          # ---------------------------------------------
+          # Validate portal JSON
+          # ---------------------------------------------
+
+          data = json.loads(
+              json_path.read_text(encoding="utf-8")
+          )
 
           if not isinstance(data, dict):
-              raise SystemExit("Payload root must be a JSON object.")
+              raise SystemExit(
+                  "Payload root must be a JSON object."
+              )
 
           if data.get("status") != "ok":
-              raise SystemExit("Payload status is not ok.")
+              raise SystemExit(
+                  "Payload status is not ok."
+              )
 
           worlds = data.get("worlds")
+
           if not isinstance(worlds, list):
-              raise SystemExit("Payload worlds must be an array.")
+              raise SystemExit(
+                  "Payload worlds must be an array."
+              )
 
           world_count = data.get("worldCount")
+
           if not isinstance(world_count, int):
-              raise SystemExit("Payload worldCount must be an integer.")
+              raise SystemExit(
+                  "Payload worldCount must be an integer."
+              )
 
           if world_count != len(worlds):
-              raise SystemExit("worldCount does not match worlds length.")
+              raise SystemExit(
+                  "worldCount does not match worlds length."
+              )
 
           if world_count <= 0:
-              raise SystemExit("Refusing to publish an empty payload.")
+              raise SystemExit(
+                  "Refusing to publish an empty payload."
+              )
 
-          print(f"Validated {world_count} worlds.")
+          # ---------------------------------------------
+          # Validate world-index.csv
+          # ---------------------------------------------
+
+          world_id_regex = re.compile(
+              r"^wrld_[0-9a-fA-F]{8}-"
+              r"[0-9a-fA-F]{4}-"
+              r"[0-9a-fA-F]{4}-"
+              r"[0-9a-fA-F]{4}-"
+              r"[0-9a-fA-F]{12}$"
+          )
+
+          with csv_path.open(
+              "r",
+              encoding="utf-8-sig",
+              newline=""
+          ) as f:
+              reader = csv.reader(f)
+              rows = list(reader)
+
+          if not rows:
+              raise SystemExit(
+                  "world-index.csv is empty."
+              )
+
+          if rows[0] != ["WorldID", "WorldName"]:
+              raise SystemExit(
+                  "world-index.csv header is invalid."
+              )
+
+          csv_rows = rows[1:]
+
+          if len(csv_rows) != world_count:
+              raise SystemExit(
+                  "world-index.csv row count does not "
+                  "match worldCount."
+              )
+
+          seen_ids = set()
+
+          for row_number, row in enumerate(
+              csv_rows,
+              start=2
+          ):
+              if len(row) != 2:
+                  raise SystemExit(
+                      f"Invalid CSV column count at row "
+                      f"{row_number}."
+                  )
+
+              world_id, world_name = row
+
+              if not world_id_regex.fullmatch(world_id):
+                  raise SystemExit(
+                      f"Invalid WorldID at row "
+                      f"{row_number}: {world_id}"
+                  )
+
+              if world_id in seen_ids:
+                  raise SystemExit(
+                      f"Duplicate WorldID in CSV: "
+                      f"{world_id}"
+                  )
+
+              seen_ids.add(world_id)
+
+              if not world_name.strip():
+                  raise SystemExit(
+                      f"WorldName is empty at row "
+                      f"{row_number}."
+                  )
+
+          json_ids = {
+              str(world.get("worldId", "")).strip()
+              for world in worlds
+              if isinstance(world, dict)
+          }
+
+          if seen_ids != json_ids:
+              raise SystemExit(
+                  "World IDs in cache.json and "
+                  "world-index.csv do not match."
+              )
+
+          print(
+              f"Validated {world_count} worlds "
+              f"in JSON and CSV."
+          )
           PY
 
-          printf 'User-agent: *\nDisallow: /\n' > site/robots.txt
+          printf 'User-agent: *\nDisallow: /\n' \
+            > site/robots.txt
 
       - name: Configure Pages
         uses: actions/configure-pages@v6

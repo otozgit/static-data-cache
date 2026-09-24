@@ -5,7 +5,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
   pages: write
   id-token: write
 
@@ -22,7 +21,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Prepare output
+      - name: Prepare and validate static data
         shell: bash
         env:
           SOURCE_URL: ${{ secrets.SOURCE_URL }}
@@ -35,21 +34,10 @@ jobs:
             exit 1
           fi
 
-          # SOURCE_URL:
-          # https://xxxxx/portal-data.json
-          #
-          # から自動的に:
-          # https://xxxxx/world-index.csv
-          #
-          # を生成する
-          WORLD_INDEX_URL="${SOURCE_URL%/portal-data.json}/world-index.csv"
-
-          echo "Preparing portal data."
-          echo "World index URL derived from SOURCE_URL."
-
           mkdir -p site/data/v1
 
-          # Main portal JSON
+          # One canonical download only. All derivative files are generated
+          # from this exact payload so cross-file generation skew is impossible.
           curl \
             --fail \
             --silent \
@@ -61,161 +49,248 @@ jobs:
             "$SOURCE_URL" \
             --output site/data/v1/cache.json
 
-          # World ID -> World Name CSV
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 3 \
-            --retry-delay 2 \
-            --max-time 30 \
-            "$WORLD_INDEX_URL" \
-            --output site/data/v1/world-index.csv
-
           python3 - <<'PY'
           import csv
+          import io
           import json
           import re
           from pathlib import Path
 
-          json_path = Path("site/data/v1/cache.json")
-          csv_path = Path("site/data/v1/world-index.csv")
+          root = Path("site/data/v1")
+          json_path = root / "cache.json"
+          world_index_path = root / "world-index.csv"
+          category_index_path = root / "category-index.csv"
 
-          # ------------------------------
-          # cache.json validation
-          # ------------------------------
+          data = json.loads(json_path.read_text(encoding="utf-8"))
 
-          data = json.loads(
-              json_path.read_text(encoding="utf-8")
-          )
+          def fail(message):
+              raise SystemExit(message)
 
           if not isinstance(data, dict):
-              raise SystemExit(
-                  "Payload root must be a JSON object."
-              )
-
+              fail("Payload root must be a JSON object.")
           if data.get("status") != "ok":
-              raise SystemExit(
-                  "Payload status is not ok."
-              )
+              fail("Payload status is not ok.")
+          if data.get("schemaVersion") != 4:
+              fail("schemaVersion must be 4.")
+
+          snapshot_version = data.get("snapshotVersion")
+          payload_revision = data.get("payloadRevision")
+          snapshot_at = data.get("snapshotAt")
+
+          if not isinstance(snapshot_version, int) or snapshot_version <= 0:
+              fail("snapshotVersion must be a positive integer.")
+          if not isinstance(payload_revision, int) or payload_revision <= 0:
+              fail("payloadRevision must be a positive integer.")
+          if not isinstance(snapshot_at, str) or not snapshot_at.strip():
+              fail("snapshotAt must be a non-empty string.")
 
           worlds = data.get("worlds")
+          disabled = data.get("disabledWorldIds")
+          mains = data.get("mainCategories")
+          subs = data.get("categories")
+          localization = data.get("localization")
+          sort_orders = data.get("sortOrders")
 
           if not isinstance(worlds, list):
-              raise SystemExit(
-                  "Payload worlds must be an array."
-              )
+              fail("worlds must be an array.")
+          if not isinstance(disabled, list):
+              fail("disabledWorldIds must be an array.")
+          if not isinstance(mains, list):
+              fail("mainCategories must be an array.")
+          if not isinstance(subs, list):
+              fail("categories must be an array.")
+          if not isinstance(localization, list):
+              fail("localization must be an array.")
+          if not isinstance(sort_orders, dict):
+              fail("sortOrders must be an object.")
 
           world_count = data.get("worldCount")
-
-          if not isinstance(world_count, int):
-              raise SystemExit(
-                  "Payload worldCount must be an integer."
-              )
-
+          configured_world_count = data.get("configuredWorldCount")
+          if not isinstance(world_count, int) or world_count < 0:
+              fail("worldCount must be a non-negative integer.")
           if world_count != len(worlds):
-              raise SystemExit(
-                  "worldCount does not match worlds length."
-              )
+              fail("worldCount does not match worlds length.")
+          if not isinstance(configured_world_count, int) or configured_world_count <= 0:
+              fail("configuredWorldCount must be positive; refusing a snapshot with no configured World rows.")
 
-          if world_count <= 0:
-              raise SystemExit(
-                  "Refusing to publish an empty payload."
-              )
-
-          # ------------------------------
-          # world-index.csv validation
-          # ------------------------------
-
-          world_id_regex = re.compile(
+          world_id_re = re.compile(
               r"^wrld_[0-9a-fA-F]{8}-"
               r"[0-9a-fA-F]{4}-"
               r"[0-9a-fA-F]{4}-"
               r"[0-9a-fA-F]{4}-"
               r"[0-9a-fA-F]{12}$"
           )
+          main_key_re = re.compile(r"^MC\d{4,}$")
+          sub_key_re = re.compile(r"^SC\d{4,}$")
 
-          with csv_path.open(
-              "r",
-              encoding="utf-8-sig",
-              newline=""
-          ) as f:
-              reader = csv.reader(f)
-              rows = list(reader)
+          def unique_by(items, key, label, regex=None):
+              out = {}
+              for idx, item in enumerate(items):
+                  if not isinstance(item, dict):
+                      fail(f"{label}[{idx}] must be an object.")
+                  value = str(item.get(key, "")).strip()
+                  if not value:
+                      fail(f"{label}[{idx}].{key} is empty.")
+                  if regex and not regex.fullmatch(value):
+                      fail(f"Invalid {key}: {value}")
+                  if value in out:
+                      fail(f"Duplicate {key}: {value}")
+                  out[value] = item
+              return out
 
-          if not rows:
-              raise SystemExit(
-                  "world-index.csv is empty."
-              )
+          main_by_key = unique_by(mains, "mainCategoryKey", "mainCategories", main_key_re)
+          sub_by_key = unique_by(subs, "subCategoryKey", "categories", sub_key_re)
 
-          if rows[0] != ["WorldID", "WorldName"]:
-              raise SystemExit(
-                  "world-index.csv header is invalid."
-              )
+          # Parent integrity and active IDs.
+          main_ids = set()
+          for key, main in main_by_key.items():
+              state = str(main.get("state", "")).strip()
+              mid = str(main.get("mainCategoryId", "")).strip()
+              if state == "ACTIVE":
+                  if not mid:
+                      fail(f"ACTIVE MainCategory {key} has no MainCategoryID.")
+                  if not re.fullmatch(r"M\d{3}", mid):
+                      fail(f"Invalid active MainCategoryID: {mid}")
+                  if mid in main_ids:
+                      fail(f"Duplicate active MainCategoryID: {mid}")
+                  main_ids.add(mid)
 
-          csv_rows = rows[1:]
+          sub_ids = set()
+          for key, sub in sub_by_key.items():
+              parent = str(sub.get("mainCategoryKey", "")).strip()
+              if parent not in main_by_key:
+                  fail(f"SubCategory {key} references missing MainCategoryKey {parent}.")
+              state = str(sub.get("state", "")).strip()
+              cid = str(sub.get("categoryId", "")).strip()
+              if state == "ACTIVE":
+                  if not cid:
+                      fail(f"ACTIVE SubCategory {key} has no CategoryID.")
+                  if not re.fullmatch(r"\d{3}", cid):
+                      fail(f"Invalid active CategoryID: {cid}")
+                  if cid in sub_ids:
+                      fail(f"Duplicate active CategoryID: {cid}")
+                  sub_ids.add(cid)
 
-          if len(csv_rows) != world_count:
-              raise SystemExit(
-                  "world-index.csv row count does not "
-                  "match worldCount."
-              )
+          # Localization keys are permanent and unique.
+          loc_keys = set()
+          for idx, item in enumerate(localization):
+              if not isinstance(item, dict):
+                  fail(f"localization[{idx}] must be an object.")
+              key = str(item.get("key", "")).strip()
+              if not key:
+                  fail(f"localization[{idx}].key is empty.")
+              if key in loc_keys:
+                  fail(f"Duplicate localization key: {key}")
+              loc_keys.add(key)
 
-          seen_ids = set()
+          # World integrity.
+          world_ids = set()
+          for idx, world in enumerate(worlds):
+              if not isinstance(world, dict):
+                  fail(f"worlds[{idx}] must be an object.")
+              wid = str(world.get("worldId", "")).strip()
+              if not world_id_re.fullmatch(wid):
+                  fail(f"Invalid WorldID: {wid}")
+              if wid in world_ids:
+                  fail(f"Duplicate WorldID: {wid}")
+              world_ids.add(wid)
 
-          for row_number, row in enumerate(
-              csv_rows,
-              start=2
-          ):
-              if len(row) != 2:
-                  raise SystemExit(
-                      f"Invalid CSV column count "
-                      f"at row {row_number}."
-                  )
+              name = str(world.get("name", "")).strip()
+              if not name:
+                  fail(f"Published WorldName is empty: {wid}")
 
-              world_id, world_name = row
+              sub_key = str(world.get("subCategoryKey", "")).strip()
+              category = sub_by_key.get(sub_key)
+              if not category:
+                  fail(f"World {wid} references missing SubCategoryKey {sub_key}.")
+              # DISABLED_PENDING may remain visible during its grace period.
+              if str(category.get("state", "")) == "RETIRED":
+                  fail(f"World {wid} references RETIRED category {sub_key}.")
 
-              if not world_id_regex.fullmatch(world_id):
-                  raise SystemExit(
-                      f"Invalid WorldID at row "
-                      f"{row_number}: {world_id}"
-                  )
+          disabled_ids = []
+          disabled_seen = set()
+          for value in disabled:
+              wid = str(value).strip()
+              if not world_id_re.fullmatch(wid):
+                  fail(f"Invalid disabled WorldID: {wid}")
+              if wid in disabled_seen:
+                  fail(f"Duplicate disabled WorldID: {wid}")
+              disabled_seen.add(wid)
+              disabled_ids.append(wid)
 
-              if world_id in seen_ids:
-                  raise SystemExit(
-                      f"Duplicate WorldID in CSV: "
-                      f"{world_id}"
-                  )
+          overlap = world_ids & disabled_seen
+          if overlap:
+              fail("worlds and disabledWorldIds overlap: " + ", ".join(sorted(overlap)[:10]))
 
-              seen_ids.add(world_id)
-
-              if not world_name.strip():
-                  raise SystemExit(
-                      f"WorldName is empty at row "
-                      f"{row_number}."
-                  )
-
-          json_ids = {
-              str(world.get("worldId", "")).strip()
-              for world in worlds
-              if isinstance(world, dict)
+          expected_sorts = {
+              "trending", "activity1h", "favoriteRate", "favorites",
+              "recentlyUpdated", "recentlyPublished"
           }
+          if set(sort_orders.keys()) != expected_sorts:
+              fail("sortOrders keys are invalid.")
+          expected_indexes = set(range(world_count))
+          for key, order in sort_orders.items():
+              if not isinstance(order, list) or len(order) != world_count:
+                  fail(f"sortOrders.{key} length is invalid.")
+              if set(order) != expected_indexes:
+                  fail(f"sortOrders.{key} is not a permutation of world indexes.")
 
-          if seen_ids != json_ids:
-              raise SystemExit(
-                  "World IDs in cache.json and "
-                  "world-index.csv do not match."
+          # --------------------------------------------------
+          # world-index.csv generated from the canonical JSON
+          # --------------------------------------------------
+          with world_index_path.open("w", encoding="utf-8-sig", newline="") as f:
+              writer = csv.writer(f, lineterminator="\r\n")
+              writer.writerow(["WorldID", "WorldName"])
+              for world in worlds:
+                  writer.writerow([world["worldId"], world["name"]])
+
+          # --------------------------------------------------
+          # category-index.csv generated from the same payload
+          # One row per SubCategory with its parent MainCategory.
+          # --------------------------------------------------
+          def names(item):
+              n = item.get("name") if isinstance(item.get("name"), dict) else {}
+              return [
+                  str(n.get("en", "")), str(n.get("ja", "")),
+                  str(n.get("ko", "")), str(n.get("zhCN", "")),
+                  str(n.get("zhTW", ""))
+              ]
+
+          with category_index_path.open("w", encoding="utf-8-sig", newline="") as f:
+              writer = csv.writer(f, lineterminator="\r\n")
+              writer.writerow([
+                  "SnapshotVersion", "SnapshotAt",
+                  "MainCategoryKey", "MainCategoryID", "MainState",
+                  "MainName_EN", "MainName_JA", "MainName_KO", "MainName_ZH_CN", "MainName_ZH_TW",
+                  "SubCategoryKey", "CategoryID", "SubState",
+                  "SubName_EN", "SubName_JA", "SubName_KO", "SubName_ZH_CN", "SubName_ZH_TW"
+              ])
+              ordered_subs = sorted(
+                  subs,
+                  key=lambda x: (
+                      int(x.get("displayOrder", 999999) or 999999),
+                      str(x.get("subCategoryKey", ""))
+                  )
               )
+              for sub in ordered_subs:
+                  main = main_by_key[str(sub["mainCategoryKey"])]
+                  writer.writerow([
+                      snapshot_version, snapshot_at,
+                      main["mainCategoryKey"], main.get("mainCategoryId", ""), main.get("state", ""),
+                      *names(main),
+                      sub["subCategoryKey"], sub.get("categoryId", ""), sub.get("state", ""),
+                      *names(sub)
+                  ])
 
           print(
-              f"Validated {world_count} worlds "
-              f"in JSON and CSV."
+              f"Validated schema v4: snapshot={snapshot_version}, "
+              f"payloadRevision={payload_revision}, worlds={world_count}, "
+              f"mainCategories={len(mains)}, categories={len(subs)}, "
+              f"localization={len(localization)}"
           )
           PY
 
-          printf 'User-agent: *\nDisallow: /\n' \
-            > site/robots.txt
+          printf 'User-agent: *\nDisallow: /\n' > site/robots.txt
 
       - name: Configure Pages
         uses: actions/configure-pages@v6

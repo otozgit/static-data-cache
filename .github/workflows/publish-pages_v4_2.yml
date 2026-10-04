@@ -1,0 +1,63 @@
+name: Publish atomic portal bundle v4.2
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+
+permissions: {}
+
+concurrency:
+  group: pages-v4-2
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      should_deploy: ${{ steps.prepare.outputs.should_deploy }}
+      site_generation: ${{ steps.prepare.outputs.site_generation }}
+      bundle_hash: ${{ steps.prepare.outputs.bundle_hash }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Validate and prepare one saved generation
+        id: prepare
+        env:
+          SOURCE_URL: ${{ vars.SOURCE_URL }}
+          PUBLISHED_MANIFEST_URL: ${{ vars.PUBLISHED_MANIFEST_URL }}
+        run: node .github/scripts/publisher_v4_2.mjs
+      - name: Configure existing Pages site
+        if: steps.prepare.outputs.should_deploy == 'true'
+        uses: actions/configure-pages@v5
+        with:
+          enablement: false
+      - name: Upload verified artifact
+        if: steps.prepare.outputs.should_deploy == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ steps.prepare.outputs.artifact_path }}
+
+  deploy:
+    needs: prepare
+    if: needs.prepare.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy one complete artifact
+        id: deployment
+        uses: actions/deploy-pages@v4
